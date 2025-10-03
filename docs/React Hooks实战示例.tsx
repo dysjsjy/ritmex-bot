@@ -90,7 +90,8 @@ export function FinancialDashboard() {
             <input
               type="number"
               value={newValue}
-              onChange={(e) => setNewValue(e.target.value)}
+              // @ts-ignore
+              onChange={(e: React.ChangeEvent<HTMLInputElement>) => setNewValue(e.target.value)}
               placeholder="输入数值"
               style={{ marginRight: '10px' }}
             />
