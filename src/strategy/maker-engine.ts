@@ -64,50 +64,38 @@ const EPS = 1e-5;
 const INSUFFICIENT_BALANCE_COOLDOWN_MS = 15_000;
 
 export class MakerEngine {
-  private accountSnapshot: AsterAccountSnapshot | null = null;
-  private depthSnapshot: AsterDepth | null = null;
-  private tickerSnapshot: AsterTicker | null = null;
-  private openOrders: AsterOrder[] = [];
+  // 市场数据快照
+  private accountSnapshot: AsterAccountSnapshot | null = null; // 账户余额和持仓快照
+  private depthSnapshot: AsterDepth | null = null; // 市场深度数据（买卖盘）
+  private tickerSnapshot: AsterTicker | null = null; // 最新价格和交易量数据
+  private openOrders: AsterOrder[] = []; // 当前活跃的挂单列表
 
-  private readonly locks: OrderLockMap = {};
-  private readonly timers: OrderTimerMap = {};
-  private readonly pending: OrderPendingMap = {};
-  private readonly pendingCancelOrders = new Set<string>();
+  // 订单管理状态
+  private readonly locks: OrderLockMap = {}; // 订单操作锁，防止重复操作
+  private readonly timers: OrderTimerMap = {}; // 订单操作计时器
+  private readonly pending: OrderPendingMap = {}; // 待处理的订单操作
+  private readonly pendingCancelOrders = new Set<number>(); // 待取消的订单ID集合
 
-  private readonly tradeLog: ReturnType<typeof createTradeLog>;
-  private readonly events = new StrategyEventEmitter<MakerEvent, MakerEngineSnapshot>();
-  private readonly sessionVolume = new SessionVolumeTracker();
+  // 系统组件
+  private readonly tradeLog: ReturnType<typeof createTradeLog>; // 交易日志记录器
+  private readonly listeners = new Map<MakerEvent, Set<MakerListener>>(); // 事件监听器集合
 
-  private timer: ReturnType<typeof setInterval> | null = null;
-  private processing = false;
-  private desiredOrders: DesiredOrder[] = [];
-  private accountUnrealized = 0;
-  private initialOrderSnapshotReady = false;
-  private initialOrderResetDone = false;
-  private entryPricePendingLogged = false;
-  private readinessLogged = {
-    account: false,
-    depth: false,
-    ticker: false,
-    orders: false,
-  };
-  private feedArrived = {
-    account: false,
-    depth: false,
-    ticker: false,
-    orders: false,
-  };
-  private feedStatus = {
-    account: false,
-    depth: false,
-    ticker: false,
-    orders: false,
-  };
-  private insufficientBalanceCooldownUntil = 0;
-  private insufficientBalanceNotified = false;
-  private lastInsufficientMessage: string | null = null;
-  private lastDesiredSummary: string | null = null;
-  private readonly rateLimit: RateLimitController;
+  // 运行时状态
+  private timer: ReturnType<typeof setInterval> | null = null; // 定时器句柄
+  private processing = false; // 是否正在处理tick循环（防重入）
+  private desiredOrders: DesiredOrder[] = []; // 期望的订单配置（策略生成）
+  private accountUnrealized = 0; // 账户未实现盈亏
+  private sessionQuoteVolume = 0; // 本会话交易量（以计价货币计）
+  private prevPositionAmt = 0; // 上一次的持仓数量（用于计算变化）
+  
+  // 初始化状态标志
+  private initializedPosition = false; // 持仓是否已初始化
+  private initialOrderSnapshotReady = false; // 初始订单快照是否就绪
+  private initialOrderResetDone = false; // 初始订单重置是否完成
+  private entryPricePendingLogged = false; // 入场价格是否已记录
+  
+  // 速率控制
+  private readonly rateLimit: RateLimitController; // 请求速率限制控制器
 
   constructor(private readonly config: MakerConfig, private readonly exchange: ExchangeAdapter) {
     this.tradeLog = createTradeLog(this.config.maxLogEntries);
@@ -258,11 +246,13 @@ export class MakerEngine {
     );
   }
 
+  // 这是程序持续运行的主要函数，通过不断调用 tick 方法来实现
   private async tick(): Promise<void> {
     if (this.processing) return;
     this.processing = true;
     let hadRateLimit = false;
     try {
+      // rateLimit 控制速率
       const decision = this.rateLimit.beforeCycle();
       if (decision === "paused") {
         this.emitUpdate();
@@ -289,17 +279,19 @@ export class MakerEngine {
         return;
       }
 
-      // 直接使用orderbook价格，格式化为字符串避免精度问题
-      const priceDecimals = Math.max(0, Math.floor(Math.log10(1 / this.config.priceTick)));
-      const closeBidPrice = formatPriceToString(topBid, priceDecimals);
-      const closeAskPrice = formatPriceToString(topAsk, priceDecimals);
-      const bidPrice = formatPriceToString(topBid - this.config.bidOffset, priceDecimals);
-      const askPrice = formatPriceToString(topAsk + this.config.askOffset, priceDecimals);
-      const position = getPosition(this.accountSnapshot, this.config.symbol);
-      const absPosition = Math.abs(position.positionAmt);
-      const desired: DesiredOrder[] = [];
-      const insufficientActive = this.applyInsufficientBalanceState(Date.now());
-      const canEnter = !this.rateLimit.shouldBlockEntries() && !insufficientActive;
+      // 计算做市订单价格
+      const bidPrice = roundDownToTick(topBid - this.config.bidOffset, this.config.priceTick); // 买单价格（最高买价 - 偏移量）
+      const askPrice = roundDownToTick(topAsk + this.config.askOffset, this.config.priceTick); // 卖单价格（最低卖价 + 偏移量）
+      
+      // 获取当前持仓状态
+      const position = getPosition(this.accountSnapshot, this.config.symbol); // 当前持仓信息
+      const absPosition = Math.abs(position.positionAmt); // 持仓绝对值（不考虑方向）
+      
+      // 初始化期望订单列表
+      const desired: DesiredOrder[] = []; // 期望的订单配置列表
+      
+      // 检查是否可以开新仓
+      const canEnter = !this.rateLimit.shouldBlockEntries(); // 是否允许开新仓（基于速率限制）
 
       if (absPosition < EPS) {
         this.entryPricePendingLogged = false;
@@ -564,75 +556,5 @@ export class MakerEngine {
 
   private getReferencePrice(): number | null {
     return getMidOrLast(this.depthSnapshot, this.tickerSnapshot);
-  }
-
-  private logReadinessBlockers(): void {
-    if (!this.feedStatus.account && !this.readinessLogged.account) {
-      this.tradeLog.push("info", "等待账户快照同步，尚未开始做市");
-      this.readinessLogged.account = true;
-    }
-    if (!this.feedStatus.depth && !this.readinessLogged.depth) {
-      this.tradeLog.push("info", "等待深度行情推送，尚未开始做市");
-      this.readinessLogged.depth = true;
-    }
-    if (!this.feedStatus.ticker && !this.readinessLogged.ticker) {
-      this.tradeLog.push("info", "等待Ticker推送，尚未开始做市");
-      this.readinessLogged.ticker = true;
-    }
-    if (!this.feedStatus.orders && !this.readinessLogged.orders) {
-      this.tradeLog.push("info", "等待订单快照返回，尚未执行初始化撤单");
-      this.readinessLogged.orders = true;
-    }
-  }
-
-  private resetReadinessFlags(): void {
-    this.readinessLogged = {
-      account: false,
-      depth: false,
-      ticker: false,
-      orders: false,
-    };
-  }
-
-  private logDesiredOrders(desired: DesiredOrder[]): void {
-    if (!desired.length) {
-      if (this.lastDesiredSummary !== "none") {
-        this.tradeLog.push("info", "当前无目标挂单，等待下一次刷新");
-        this.lastDesiredSummary = "none";
-      }
-      return;
-    }
-    const summary = desired
-      .map((order) => `${order.side}@${order.price}${order.reduceOnly ? "(RO)" : ""}`)
-      .join(" | ");
-    if (summary !== this.lastDesiredSummary) {
-      this.tradeLog.push("info", `目标挂单: ${summary}`);
-      this.lastDesiredSummary = summary;
-    }
-  }
-
-  private registerInsufficientBalance(error: unknown): void {
-    const now = Date.now();
-    const detail = extractMessage(error);
-    const alreadyActive = now < this.insufficientBalanceCooldownUntil;
-    if (alreadyActive && detail === this.lastInsufficientMessage) {
-      this.insufficientBalanceCooldownUntil = now + INSUFFICIENT_BALANCE_COOLDOWN_MS;
-      return;
-    }
-    this.insufficientBalanceCooldownUntil = now + INSUFFICIENT_BALANCE_COOLDOWN_MS;
-    this.lastInsufficientMessage = detail;
-    const seconds = Math.ceil(INSUFFICIENT_BALANCE_COOLDOWN_MS / 1000);
-    this.tradeLog.push("warn", `余额不足，暂停新挂单 ${seconds}s: ${detail}`);
-    this.insufficientBalanceNotified = true;
-  }
-
-  private applyInsufficientBalanceState(now: number): boolean {
-    const active = now < this.insufficientBalanceCooldownUntil;
-    if (!active && this.insufficientBalanceNotified) {
-      this.tradeLog.push("info", "余额检测恢复，重新尝试挂单");
-      this.insufficientBalanceNotified = false;
-      this.lastInsufficientMessage = null;
-    }
-    return active;
   }
 }
