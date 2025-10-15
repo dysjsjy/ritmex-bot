@@ -52,30 +52,38 @@ type MakerListener = (snapshot: MakerEngineSnapshot) => void;
 const EPS = 1e-5;
 
 export class MakerEngine {
-  private accountSnapshot: AsterAccountSnapshot | null = null;
-  private depthSnapshot: AsterDepth | null = null;
-  private tickerSnapshot: AsterTicker | null = null;
-  private openOrders: AsterOrder[] = [];
+  // 市场数据快照
+  private accountSnapshot: AsterAccountSnapshot | null = null; // 账户余额和持仓快照
+  private depthSnapshot: AsterDepth | null = null; // 市场深度数据（买卖盘）
+  private tickerSnapshot: AsterTicker | null = null; // 最新价格和交易量数据
+  private openOrders: AsterOrder[] = []; // 当前活跃的挂单列表
 
-  private readonly locks: OrderLockMap = {};
-  private readonly timers: OrderTimerMap = {};
-  private readonly pending: OrderPendingMap = {};
-  private readonly pendingCancelOrders = new Set<number>();
+  // 订单管理状态
+  private readonly locks: OrderLockMap = {}; // 订单操作锁，防止重复操作
+  private readonly timers: OrderTimerMap = {}; // 订单操作计时器
+  private readonly pending: OrderPendingMap = {}; // 待处理的订单操作
+  private readonly pendingCancelOrders = new Set<number>(); // 待取消的订单ID集合
 
-  private readonly tradeLog: ReturnType<typeof createTradeLog>;
-  private readonly listeners = new Map<MakerEvent, Set<MakerListener>>();
+  // 系统组件
+  private readonly tradeLog: ReturnType<typeof createTradeLog>; // 交易日志记录器
+  private readonly listeners = new Map<MakerEvent, Set<MakerListener>>(); // 事件监听器集合
 
-  private timer: ReturnType<typeof setInterval> | null = null;
-  private processing = false;
-  private desiredOrders: DesiredOrder[] = [];
-  private accountUnrealized = 0;
-  private sessionQuoteVolume = 0;
-  private prevPositionAmt = 0;
-  private initializedPosition = false;
-  private initialOrderSnapshotReady = false;
-  private initialOrderResetDone = false;
-  private entryPricePendingLogged = false;
-  private readonly rateLimit: RateLimitController;
+  // 运行时状态
+  private timer: ReturnType<typeof setInterval> | null = null; // 定时器句柄
+  private processing = false; // 是否正在处理tick循环（防重入）
+  private desiredOrders: DesiredOrder[] = []; // 期望的订单配置（策略生成）
+  private accountUnrealized = 0; // 账户未实现盈亏
+  private sessionQuoteVolume = 0; // 本会话交易量（以计价货币计）
+  private prevPositionAmt = 0; // 上一次的持仓数量（用于计算变化）
+  
+  // 初始化状态标志
+  private initializedPosition = false; // 持仓是否已初始化
+  private initialOrderSnapshotReady = false; // 初始订单快照是否就绪
+  private initialOrderResetDone = false; // 初始订单重置是否完成
+  private entryPricePendingLogged = false; // 入场价格是否已记录
+  
+  // 速率控制
+  private readonly rateLimit: RateLimitController; // 请求速率限制控制器
 
   constructor(private readonly config: MakerConfig, private readonly exchange: ExchangeAdapter) {
     this.tradeLog = createTradeLog(this.config.maxLogEntries);
@@ -217,11 +225,13 @@ export class MakerEngine {
     return Boolean(this.accountSnapshot && this.depthSnapshot);
   }
 
+  // 这是程序持续运行的主要函数，通过不断调用 tick 方法来实现
   private async tick(): Promise<void> {
     if (this.processing) return;
     this.processing = true;
     let hadRateLimit = false;
     try {
+      // rateLimit 控制速率
       const decision = this.rateLimit.beforeCycle();
       if (decision === "paused") {
         this.emitUpdate();
@@ -246,12 +256,19 @@ export class MakerEngine {
         return;
       }
 
-      const bidPrice = roundDownToTick(topBid - this.config.bidOffset, this.config.priceTick);
-      const askPrice = roundDownToTick(topAsk + this.config.askOffset, this.config.priceTick);
-      const position = getPosition(this.accountSnapshot, this.config.symbol);
-      const absPosition = Math.abs(position.positionAmt);
-      const desired: DesiredOrder[] = [];
-      const canEnter = !this.rateLimit.shouldBlockEntries();
+      // 计算做市订单价格
+      const bidPrice = roundDownToTick(topBid - this.config.bidOffset, this.config.priceTick); // 买单价格（最高买价 - 偏移量）
+      const askPrice = roundDownToTick(topAsk + this.config.askOffset, this.config.priceTick); // 卖单价格（最低卖价 + 偏移量）
+      
+      // 获取当前持仓状态
+      const position = getPosition(this.accountSnapshot, this.config.symbol); // 当前持仓信息
+      const absPosition = Math.abs(position.positionAmt); // 持仓绝对值（不考虑方向）
+      
+      // 初始化期望订单列表
+      const desired: DesiredOrder[] = []; // 期望的订单配置列表
+      
+      // 检查是否可以开新仓
+      const canEnter = !this.rateLimit.shouldBlockEntries(); // 是否允许开新仓（基于速率限制）
 
       if (absPosition < EPS) {
         this.entryPricePendingLogged = false;
